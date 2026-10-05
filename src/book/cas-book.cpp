@@ -12,28 +12,30 @@ void CASBook::add(Order order) { orders_.push_back(std::move(order)); }
 
 const std::string& CASBook::symbol() const noexcept { return symbol_; }
 
-/*
-** Step 2: The auction price must be one of the order prices.
-** Partition orders into limit buys/sells (price != 0) and market orders
-** (price == 0). Collect every distinct limit price as a candidate.
-*/
 void CASBook::partition_orders(std::vector<const Order*>& buys,
                                std::vector<const Order*>& sells,
-                               std::vector<double>& candidates,
+                               std::uint64_t& limit_buy_vol,
                                std::uint64_t& market_buy_vol,
                                std::uint64_t& market_sell_vol,
                                std::uint64_t& oldest_market_buy,
                                std::uint64_t& oldest_market_sell) const
 {
   constexpr auto MAX_TS = std::numeric_limits<std::uint64_t>::max();
+
+  limit_buy_vol = 0;
   market_buy_vol = 0;
   market_sell_vol = 0;
+
   oldest_market_buy = MAX_TS;
   oldest_market_sell = MAX_TS;
 
+  buys.reserve(orders_.size());
+  sells.reserve(orders_.size());
+
   for (const auto& o : orders_)
   {
-    bool is_market = (o.price == 0.0);
+    const bool is_market = (o.price == 0.0);
+
     if (o.side == OrderType::BUY)
     {
       if (is_market)
@@ -44,7 +46,7 @@ void CASBook::partition_orders(std::vector<const Order*>& buys,
       else
       {
         buys.push_back(&o);
-        candidates.push_back(o.price);
+        limit_buy_vol += o.volume;
       }
     }
     else
@@ -55,147 +57,101 @@ void CASBook::partition_orders(std::vector<const Order*>& buys,
         oldest_market_sell = std::min(oldest_market_sell, o.timestamp);
       }
       else
-      {
         sells.push_back(&o);
-        candidates.push_back(o.price);
-      }
     }
   }
-
-  std::sort(candidates.begin(), candidates.end());
-  candidates.erase(std::unique(candidates.begin(), candidates.end()),
-                   candidates.end());
 }
 
-/*
-** Sort limit orders by price (ascending) and build:
-**   - buy_vol_prefix / sell_vol_prefix  (cumulative volumes)
-**   - min_ts_buy_suffix / min_ts_sell_prefix (oldest eligible timestamp)
-** These allow O(log N) volume and O(1) timestamp lookups per candidate.
-*/
 void CASBook::build_index(std::vector<const Order*>& buys,
                           std::vector<const Order*>& sells,
-                          std::vector<std::uint64_t>& buy_vol_prefix,
-                          std::vector<std::uint64_t>& sell_vol_prefix,
-                          std::vector<std::uint64_t>& min_ts_buy_suffix,
-                          std::vector<std::uint64_t>& min_ts_sell_prefix)
+                          std::vector<std::uint64_t>& min_ts_buy_suffix)
 {
   constexpr auto MAX_TS = std::numeric_limits<std::uint64_t>::max();
+
   auto by_price = [](const Order* a, const Order* b) {
     return a->price < b->price;
   };
+
   std::sort(buys.begin(), buys.end(), by_price);
   std::sort(sells.begin(), sells.end(), by_price);
 
-  // Volume prefix sums.
-  buy_vol_prefix.assign(buys.size() + 1, 0);
-  for (std::size_t i = 0; i < buys.size(); ++i)
-    buy_vol_prefix[i + 1] = buy_vol_prefix[i] + buys[i]->volume;
-
-  sell_vol_prefix.assign(sells.size() + 1, 0);
-  for (std::size_t i = 0; i < sells.size(); ++i)
-    sell_vol_prefix[i + 1] = sell_vol_prefix[i] + sells[i]->volume;
-
-  // Oldest-timestamp suffix (buys) and prefix (sells) for Step 7.
   min_ts_buy_suffix.assign(buys.size() + 1, MAX_TS);
+
   for (std::size_t i = buys.size(); i > 0; --i)
+  {
     min_ts_buy_suffix[i - 1] =
       std::min(min_ts_buy_suffix[i], buys[i - 1]->timestamp);
-
-  min_ts_sell_prefix.assign(sells.size() + 1, MAX_TS);
-  for (std::size_t i = 0; i < sells.size(); ++i)
-    min_ts_sell_prefix[i + 1] =
-      std::min(min_ts_sell_prefix[i], sells[i]->timestamp);
+  }
 }
 
 /*
-** Steps 3–7: For a single candidate price p, compute crossed volume and
-** imbalance, then decide whether p beats the current best according to the
-** auction tie-breaking cascade.
+** Steps 3–7: Evaluate one candidate price.
+** buy_qty and sell_qty are the quantities currently eligible at p.
 */
-void CASBook::evaluate_candidate(
-  double p,
-  double reference_price,
-  const std::vector<const Order*>& buys,
-  const std::vector<const Order*>& sells,
-  std::uint64_t market_buy_vol,
-  std::uint64_t market_sell_vol,
-  std::uint64_t oldest_market_buy,
-  std::uint64_t oldest_market_sell,
-  const std::vector<std::uint64_t>& buy_vol_prefix,
-  const std::vector<std::uint64_t>& sell_vol_prefix,
-  const std::vector<std::uint64_t>& min_ts_buy_suffix,
-  const std::vector<std::uint64_t>& min_ts_sell_prefix,
-  Stats& best,
-  std::uint64_t& best_abs_imbalance,
-  double& best_distance,
-  bool& have_best)
+void CASBook::evaluate_candidate(double p,
+                                 double reference_price,
+                                 std::uint64_t buy_qty,
+                                 std::uint64_t sell_qty,
+                                 std::uint64_t oldest_buy_ts,
+                                 std::uint64_t oldest_sell_ts,
+                                 Stats& best,
+                                 std::uint64_t& best_abs_imbalance,
+                                 double& best_distance,
+                                 bool& have_best)
 {
   constexpr auto MAX_TS = std::numeric_limits<std::uint64_t>::max();
+  const std::uint64_t volume = std::min(buy_qty, sell_qty);
+  const std::uint64_t abs_imbalance =
+    (buy_qty >= sell_qty) ? (buy_qty - sell_qty) : (sell_qty - buy_qty);
+  const std::int64_t imbalance = (buy_qty >= sell_qty)
+    ? static_cast<std::int64_t>(abs_imbalance)
+    : -static_cast<std::int64_t>(abs_imbalance);
 
-  // Step 4: Eligible buys have price >= p, eligible sells have price <= p.
-  auto bi = static_cast<std::size_t>(std::distance(
-    buys.begin(),
-    std::lower_bound(buys.begin(), buys.end(), p,
-                     [](const Order* o, double v) { return o->price < v; })));
-  auto si = static_cast<std::size_t>(std::distance(
-    sells.begin(),
-    std::upper_bound(sells.begin(), sells.end(), p,
-                     [](double v, const Order* o) { return v < o->price; })));
-
-  std::uint64_t bq =
-    market_buy_vol + (buy_vol_prefix.back() - buy_vol_prefix[bi]);
-  std::uint64_t sq = market_sell_vol + sell_vol_prefix[si];
-
-  // Step 3: Crossed volume = minimum of total eligible buy / sell volume.
-  std::uint64_t volume = std::min(bq, sq);
-
-  // Step 5: Signed imbalance (positive = buy surplus, negative = sell surplus).
-  auto imbalance =
-    static_cast<std::int64_t>(bq) - static_cast<std::int64_t>(sq);
-  std::uint64_t abs_imb = (bq >= sq) ? (bq - sq) : (sq - bq);
-
-  // Step 7: Determine the side of the oldest eligible order.
   std::uint64_t oldest_ts = MAX_TS;
   OrderType oldest_side = OrderType::BUY;
-  auto consider = [&](std::uint64_t ts, OrderType side) {
-    if (ts < oldest_ts || (ts == oldest_ts && side == OrderType::BUY))
-    {
-      oldest_ts = ts;
-      oldest_side = side;
-    }
-  };
 
-  if (oldest_market_buy != MAX_TS)
-    consider(oldest_market_buy, OrderType::BUY);
-  if (oldest_market_sell != MAX_TS)
-    consider(oldest_market_sell, OrderType::SELL);
-  if (bi < buys.size())
-    consider(min_ts_buy_suffix[bi], OrderType::BUY);
-  if (si > 0)
-    consider(min_ts_sell_prefix[si], OrderType::SELL);
+  if (oldest_buy_ts < oldest_ts)
+  {
+    oldest_ts = oldest_buy_ts;
+    oldest_side = OrderType::BUY;
+  }
+
+  if (oldest_sell_ts < oldest_ts)
+  {
+    oldest_ts = oldest_sell_ts;
+    oldest_side = OrderType::SELL;
+  }
+  else if (oldest_sell_ts == oldest_ts && oldest_sell_ts != MAX_TS)
+    oldest_side = OrderType::BUY;
+
+  const double distance = std::abs(p - reference_price);
 
   /*
-  ** Steps 3 to 7 cascade: maximize volume, then minimize |imbalance|,
-  ** then minimize distance to reference, then apply oldest-order tie-break.
+  ** Tie-breaking cascade:
+  **
+  ** 1. Maximum crossed volume
+  ** 2. Minimum absolute imbalance
+  ** 3. Minimum distance from reference price
+  ** 4. Oldest eligible BUY -> lower price
+  **    Oldest eligible SELL -> higher price
   */
-  double distance = std::abs(p - reference_price);
   bool better = !have_best;
 
   if (!better && volume > best.crossed_volume)
-    better = true; // Step 3.
+    better = true;
+
   if (!better && volume == best.crossed_volume)
   {
-    if (abs_imb < best_abs_imbalance)
-      better = true; // Step 5.
-    else if (abs_imb == best_abs_imbalance)
+    if (abs_imbalance < best_abs_imbalance)
+      better = true;
+    else if (abs_imbalance == best_abs_imbalance)
     {
       if (distance < best_distance)
-        better = true; // Step 6.
+        better = true;
       else if (distance == best_distance)
       {
         better = (oldest_side == OrderType::BUY && p < best.price)
-          || (oldest_side == OrderType::SELL && p > best.price); // Step 7.
+          || (oldest_side == OrderType::SELL && p > best.price);
       }
     }
   }
@@ -204,42 +160,91 @@ void CASBook::evaluate_candidate(
   {
     have_best = true;
     best = {p, volume, imbalance};
-    best_abs_imbalance = abs_imb;
+    best_abs_imbalance = abs_imbalance;
     best_distance = distance;
   }
 }
 
 CASBook::Stats CASBook::uncross(double reference_price) const
 {
-  std::vector<const Order*> buys, sells;
-  std::vector<double> candidates;
-  std::uint64_t market_buy_vol, market_sell_vol;
-  std::uint64_t oldest_market_buy, oldest_market_sell;
+  std::vector<const Order*> buys;
+  std::vector<const Order*> sells;
 
-  // Phase 1 – partition.
-  partition_orders(buys, sells, candidates, market_buy_vol, market_sell_vol,
+  std::uint64_t limit_buy_vol;
+  std::uint64_t market_buy_vol;
+  std::uint64_t market_sell_vol;
+  std::uint64_t oldest_market_buy;
+  std::uint64_t oldest_market_sell;
+
+  partition_orders(buys, sells, limit_buy_vol, market_buy_vol, market_sell_vol,
                    oldest_market_buy, oldest_market_sell);
-  if (candidates.empty())
+
+  if (buys.empty() && sells.empty())
     return {};
 
-  // Phase 2 – sort & build prefix/suffix arrays.
-  std::vector<std::uint64_t> buy_vol_prefix, sell_vol_prefix;
-  std::vector<std::uint64_t> min_ts_buy_suffix, min_ts_sell_prefix;
-  build_index(buys, sells, buy_vol_prefix, sell_vol_prefix, min_ts_buy_suffix,
-              min_ts_sell_prefix);
+  std::vector<std::uint64_t> min_ts_buy_suffix;
 
-  // Phase 3 – evaluate every candidate price.
+  build_index(buys, sells, min_ts_buy_suffix);
+
+  std::uint64_t buy_qty = market_buy_vol + limit_buy_vol;
+  std::uint64_t sell_qty = market_sell_vol;
+  std::size_t buy_candidate_idx = 0;
+  std::size_t sell_candidate_idx = 0;
+  std::size_t buy_eligible_idx = 0;
+  std::size_t sell_eligible_idx = 0;
+  std::uint64_t oldest_eligible_sell = oldest_market_sell;
+
   bool have_best = false;
   Stats best{};
   std::uint64_t best_abs_imbalance = 0;
   double best_distance = 0.0;
 
-  for (double p : candidates)
-    evaluate_candidate(p, reference_price, buys, sells, market_buy_vol,
-                       market_sell_vol, oldest_market_buy, oldest_market_sell,
-                       buy_vol_prefix, sell_vol_prefix, min_ts_buy_suffix,
-                       min_ts_sell_prefix, best, best_abs_imbalance,
-                       best_distance, have_best);
+  while (buy_candidate_idx < buys.size() || sell_candidate_idx < sells.size())
+  {
+    double p;
+
+    if (sell_candidate_idx >= sells.size())
+      p = buys[buy_candidate_idx]->price;
+    else if (buy_candidate_idx >= buys.size())
+      p = sells[sell_candidate_idx]->price;
+    else
+    {
+      p = std::min(buys[buy_candidate_idx]->price,
+                   sells[sell_candidate_idx]->price);
+    }
+
+    while (buy_eligible_idx < buys.size() && buys[buy_eligible_idx]->price < p)
+    {
+      buy_qty -= buys[buy_eligible_idx]->volume;
+      ++buy_eligible_idx;
+    }
+
+    while (sell_eligible_idx < sells.size()
+           && sells[sell_eligible_idx]->price <= p)
+    {
+      sell_qty += sells[sell_eligible_idx]->volume;
+
+      oldest_eligible_sell =
+        std::min(oldest_eligible_sell, sells[sell_eligible_idx]->timestamp);
+
+      ++sell_eligible_idx;
+    }
+
+    const std::uint64_t oldest_eligible_buy =
+      std::min(oldest_market_buy, min_ts_buy_suffix[buy_eligible_idx]);
+
+    evaluate_candidate(p, reference_price, buy_qty, sell_qty,
+                       oldest_eligible_buy, oldest_eligible_sell, best,
+                       best_abs_imbalance, best_distance, have_best);
+
+    while (buy_candidate_idx < buys.size()
+           && buys[buy_candidate_idx]->price == p)
+      ++buy_candidate_idx;
+
+    while (sell_candidate_idx < sells.size()
+           && sells[sell_candidate_idx]->price == p)
+      ++sell_candidate_idx;
+  }
 
   return have_best ? best : Stats{};
 }
