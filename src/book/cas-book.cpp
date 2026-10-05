@@ -20,6 +20,7 @@ void CASBook::partition_orders(std::vector<const Order*>& buys,
                                std::uint64_t& oldest_market_buy,
                                std::uint64_t& oldest_market_sell) const
 {
+  // Step 1: Order classification.
   constexpr auto MAX_TS = std::numeric_limits<std::uint64_t>::max();
 
   limit_buy_vol = 0;
@@ -34,6 +35,7 @@ void CASBook::partition_orders(std::vector<const Order*>& buys,
 
   for (const auto& o : orders_)
   {
+    // A market order is identified by a price of 0.0.
     const bool is_market = (o.price == 0.0);
 
     if (o.side == OrderType::BUY)
@@ -66,15 +68,21 @@ void CASBook::build_index(std::vector<const Order*>& buys,
                           std::vector<const Order*>& sells,
                           std::vector<std::uint64_t>& min_ts_buy_suffix)
 {
+  // Step 2: Sorting and index construction.
   constexpr auto MAX_TS = std::numeric_limits<std::uint64_t>::max();
 
   auto by_price = [](const Order* a, const Order* b) {
     return a->price < b->price;
   };
 
+  // Limit buy and sell orders are independently sorted by price in ascending order.
   std::sort(buys.begin(), buys.end(), by_price);
   std::sort(sells.begin(), sells.end(), by_price);
 
+  /*
+  ** Suffix-minimum timestamp array for buy orders.
+  ** Obtains the oldest eligible buy order in constant time.
+  */
   min_ts_buy_suffix.assign(buys.size() + 1, MAX_TS);
 
   for (std::size_t i = buys.size(); i > 0; --i)
@@ -85,7 +93,7 @@ void CASBook::build_index(std::vector<const Order*>& buys,
 }
 
 /*
-** Steps 3–7: Evaluate one candidate price.
+** Step 5: Evaluation of a candidate price.
 ** buy_qty and sell_qty are the quantities currently eligible at p.
 */
 void CASBook::evaluate_candidate(double p,
@@ -127,13 +135,8 @@ void CASBook::evaluate_candidate(double p,
   const double distance = std::abs(p - reference_price);
 
   /*
-  ** Tie-breaking cascade:
-  **
-  ** 1. Maximum crossed volume
-  ** 2. Minimum absolute imbalance
-  ** 3. Minimum distance from reference price
-  ** 4. Oldest eligible BUY -> lower price
-  **    Oldest eligible SELL -> higher price
+  ** Step 6: Selection of the auction price.
+  ** Max crossed volume, min imbalance, distance, oldest order.
   */
   bool better = !have_best;
 
@@ -176,6 +179,7 @@ CASBook::Stats CASBook::uncross(double reference_price) const
   std::uint64_t oldest_market_buy;
   std::uint64_t oldest_market_sell;
 
+  // Step 1: Separate market and limit orders.
   partition_orders(buys, sells, limit_buy_vol, market_buy_vol, market_sell_vol,
                    oldest_market_buy, oldest_market_sell);
 
@@ -184,8 +188,10 @@ CASBook::Stats CASBook::uncross(double reference_price) const
 
   std::vector<std::uint64_t> min_ts_buy_suffix;
 
+  // Step 2: Build a suffix minimum-timestamp index for buy orders.
   build_index(buys, sells, min_ts_buy_suffix);
 
+  // Step 3: Initialize the eligible buy and sell volumes.
   std::uint64_t buy_qty = market_buy_vol + limit_buy_vol;
   std::uint64_t sell_qty = market_sell_vol;
   std::size_t buy_candidate_idx = 0;
@@ -199,6 +205,7 @@ CASBook::Stats CASBook::uncross(double reference_price) const
   std::uint64_t best_abs_imbalance = 0;
   double best_distance = 0.0;
 
+  // Step 4: Traverse all distinct limit-order prices in ascending order.
   while (buy_candidate_idx < buys.size() || sell_candidate_idx < sells.size())
   {
     double p;
@@ -213,12 +220,17 @@ CASBook::Stats CASBook::uncross(double reference_price) const
                    sells[sell_candidate_idx]->price);
     }
 
+    /*
+    ** Step 7: Incrementally update the eligible buy and sell volumes.
+    ** A buy order remains eligible when buy_price >= p.
+    */
     while (buy_eligible_idx < buys.size() && buys[buy_eligible_idx]->price < p)
     {
       buy_qty -= buys[buy_eligible_idx]->volume;
       ++buy_eligible_idx;
     }
 
+    // A sell order becomes eligible when sell_price <= p.
     while (sell_eligible_idx < sells.size()
            && sells[sell_eligible_idx]->price <= p)
     {
@@ -233,6 +245,7 @@ CASBook::Stats CASBook::uncross(double reference_price) const
     const std::uint64_t oldest_eligible_buy =
       std::min(oldest_market_buy, min_ts_buy_suffix[buy_eligible_idx]);
 
+    // Steps 5 and 6: Evaluate candidate price and select if it's the best.
     evaluate_candidate(p, reference_price, buy_qty, sell_qty,
                        oldest_eligible_buy, oldest_eligible_sell, best,
                        best_abs_imbalance, best_distance, have_best);
